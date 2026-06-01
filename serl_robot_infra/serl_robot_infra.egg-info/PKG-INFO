@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: serl_robot_infra
 Version: 0.0.1
 Requires-Dist: gymnasium
@@ -7,6 +7,7 @@ Requires-Dist: pymodbus==2.5.3
 Requires-Dist: opencv-python
 Requires-Dist: pyquaternion
 Requires-Dist: pyspacemouse
+Requires-Dist: easyhid
 Requires-Dist: hidapi
 Requires-Dist: pyyaml
 Requires-Dist: rospkg
@@ -14,3 +15,4 @@ Requires-Dist: scipy
 Requires-Dist: requests
 Requires-Dist: flask
 Requires-Dist: defusedxml
+Dynamic: requires-dist

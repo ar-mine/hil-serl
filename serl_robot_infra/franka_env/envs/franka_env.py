@@ -15,6 +15,7 @@ from typing import Dict
 
 from franka_env.camera.video_capture import VideoCapture
 from franka_env.camera.rs_capture import RSCapture
+from franka_env.camera.shared_memory_capture import SharedMemoryCapture
 from franka_env.utils.rotations import euler_2_quat, quat_2_euler
 
 
@@ -397,9 +398,19 @@ class FrankaEnv(gym.Env):
 
         self.cap = OrderedDict()
         for cam_name, kwargs in name_serial_dict.items():
-            cap = VideoCapture(
-                RSCapture(name=cam_name, **kwargs)
-            )
+            if isinstance(kwargs, str):
+                kwargs = {"serial_number": kwargs}
+            kwargs = dict(kwargs)
+            backend = kwargs.pop("backend", "realsense")
+
+            if backend in ("realsense", "rs"):
+                capture = RSCapture(name=cam_name, **kwargs)
+            elif backend in ("shared_memory", "shm"):
+                capture = SharedMemoryCapture(name=cam_name, **kwargs)
+            else:
+                raise ValueError(f"Unknown camera backend for {cam_name}: {backend}")
+
+            cap = VideoCapture(capture)
             self.cap[cam_name] = cap
 
     def close_cameras(self):

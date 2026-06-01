@@ -1,0 +1,30 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python packaging/build artifacts
+*.egg-info/
+build/
+dist/
+*.egg
+
+# Virtual environments and local dependency state
+.venv/
+venv/
+env/
+.env/
+.python-version
+.uv-cache/
+
+# Test/type-check/tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime outputs
+videos/
+wandb/
+*.log

@@ -11,6 +11,7 @@ setup(
         "opencv-python",
         "pyquaternion",
         "pyspacemouse",
+        "easyhid",
         "hidapi",
         "pyyaml",
         "rospkg",

@@ -4,6 +4,7 @@ pymodbus==2.5.3
 opencv-python
 pyquaternion
 pyspacemouse
+easyhid
 hidapi
 pyyaml
 rospkg
