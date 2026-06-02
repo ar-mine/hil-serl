@@ -51,19 +51,24 @@ class FrankaRos2Server(Node):
         pose_service: str,
         control_mode_service: str,
         trajectory_action: str,
+        equilibrium_pose_topic: str,
+        pose_command_mode: str,
         move_to_start_action: str,
         gripper_move_action: str,
         gripper_grasp_action: str,
         gripper_homing_action: str,
         pose_steps: int,
         action_timeout: float,
+        default_gripper_open_width: float,
         default_gripper_speed: float,
         default_gripper_force: float,
     ):
         super().__init__("franka_ros2_http_server")
         self.controller_name = controller_name
         self.pose_steps = max(1, pose_steps)
+        self.pose_command_mode = pose_command_mode
         self.action_timeout = action_timeout
+        self.default_gripper_open_width = float(default_gripper_open_width)
         self.default_gripper_speed = default_gripper_speed
         self.default_gripper_force = default_gripper_force
 
@@ -76,6 +81,10 @@ class FrankaRos2Server(Node):
         self.dq = np.zeros(7)
         self.jacobian = np.zeros((6, 7))
         self.gripper_pos = 0.0
+        self.gripper_load_mass = 0.0
+        self.gripper_load_center_of_mass = [0.0, 0.0, 0.0]
+        self.last_command_pose: Optional[np.ndarray] = None
+        self.last_command_pose_time = 0.0
         self._last_state_time = 0.0
         self._last_gripper_time = 0.0
 
@@ -100,6 +109,11 @@ class FrankaRos2Server(Node):
 
         self._pose_client = self.create_client(GetPose, pose_service)
         self._control_mode_client = self.create_client(SetControlMode, control_mode_service)
+        self._equilibrium_pose_publisher = self.create_publisher(
+            PoseStamped,
+            equilibrium_pose_topic,
+            10,
+        )
         self._set_parameters_client = self.create_client(
             SetParameters,
             f"/{controller_name}/set_parameters",
@@ -155,9 +169,49 @@ class FrankaRos2Server(Node):
                 "dq": self.dq.tolist(),
                 "jacobian": self.jacobian.tolist(),
                 "gripper_pos": self.gripper_pos,
+                "gripper_load_mass": self.gripper_load_mass,
+                "gripper_load_center_of_mass": list(self.gripper_load_center_of_mass),
+                "pose_command_mode": self.pose_command_mode,
                 "state_age": time.time() - self._last_state_time if self._last_state_time else None,
                 "gripper_age": time.time() - self._last_gripper_time if self._last_gripper_time else None,
             }
+
+    def pose_debug_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            current_pose = self.pos.copy()
+            command_pose = None if self.last_command_pose is None else self.last_command_pose.copy()
+            command_age = (
+                time.time() - self.last_command_pose_time
+                if self.last_command_pose_time
+                else None
+            )
+
+        if command_pose is None:
+            return {
+                "has_command_pose": False,
+                "current_pose": current_pose.tolist(),
+                "command_pose": None,
+                "command_age": command_age,
+            }
+
+        current_rot = R.from_quat(current_pose[3:])
+        command_rot = R.from_quat(command_pose[3:])
+        orientation_error = current_rot.inv() * command_rot
+        return {
+            "has_command_pose": True,
+            "current_pose": current_pose.tolist(),
+            "command_pose": command_pose.tolist(),
+            "command_age": command_age,
+            "position_error_current_minus_command": (current_pose[:3] - command_pose[:3]).tolist(),
+            "orientation_error_rotvec_current_to_command": orientation_error.as_rotvec().tolist(),
+            "orientation_error_angle_rad": float(orientation_error.magnitude()),
+            "current_rpy": current_rot.as_euler("xyz").tolist(),
+            "command_rpy": command_rot.as_euler("xyz").tolist(),
+            "rpy_error_command_minus_current": (
+                command_rot.as_euler("xyz") - current_rot.as_euler("xyz")
+            ).tolist(),
+            "pose_command_mode": self.pose_command_mode,
+        }
 
     def pose_from_service(self) -> Optional[np.ndarray]:
         if not self._pose_client.wait_for_service(timeout_sec=0.2):
@@ -182,10 +236,24 @@ class FrankaRos2Server(Node):
     def send_pose(self, pose: np.ndarray) -> bool:
         if pose.shape != (7,):
             raise ValueError("pose must be xyz+quaternion with shape (7,)")
+        with self._lock:
+            self.last_command_pose = pose.copy()
+            self.last_command_pose_time = time.time()
+        pose_msg = self._pose_to_msg(pose)
+
+        if self.pose_command_mode == "equilibrium":
+            self._equilibrium_pose_publisher.publish(pose_msg)
+            return True
+
         if not self._trajectory_client.wait_for_server(timeout_sec=self.action_timeout):
             self.get_logger().error("SetTrajectory action server is not available")
             return False
 
+        goal = SetTrajectory.Goal()
+        goal.trajectory = [pose_msg for _ in range(self.pose_steps)]
+        return self._send_action_goal_and_wait(self._trajectory_client, goal)
+
+    def _pose_to_msg(self, pose: np.ndarray) -> PoseStamped:
         pose_msg = PoseStamped()
         pose_msg.header.frame_id = "panda_link0"
         pose_msg.header.stamp = self.get_clock().now().to_msg()
@@ -196,10 +264,7 @@ class FrankaRos2Server(Node):
             z=float(pose[5]),
             w=float(pose[6]),
         )
-
-        goal = SetTrajectory.Goal()
-        goal.trajectory = [pose_msg for _ in range(self.pose_steps)]
-        return self._send_action_goal_and_wait(self._trajectory_client, goal)
+        return pose_msg
 
     def joint_reset(self) -> bool:
         if not self._move_to_start_client.wait_for_server(timeout_sec=self.action_timeout):
@@ -222,7 +287,13 @@ class FrankaRos2Server(Node):
         return bool(result.success)
 
     def open_gripper(self) -> bool:
-        return self.move_gripper_width(width=0.08, speed=self.default_gripper_speed)
+        with self._lock:
+            if self.gripper_pos > 0.95:
+                return True
+        return self.move_gripper_width(
+            width=self.default_gripper_open_width,
+            speed=self.default_gripper_speed,
+        )
 
     def close_gripper(self, slow: bool = False) -> bool:
         if not self._gripper_grasp_client.wait_for_server(timeout_sec=0.5):
@@ -288,6 +359,61 @@ class FrankaRos2Server(Node):
             "mapped": mapped,
         }
 
+    def adjust_gripper_load(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            current_mass = float(self.gripper_load_mass)
+            current_com = list(self.gripper_load_center_of_mass)
+
+        if "mass" in params:
+            target_mass = float(params["mass"])
+        elif "m_load" in params:
+            target_mass = float(params["m_load"])
+        elif "gripper_load_mass" in params:
+            target_mass = float(params["gripper_load_mass"])
+        else:
+            target_mass = current_mass
+
+        if "mass_delta" in params:
+            target_mass += float(params["mass_delta"])
+
+        if not np.isfinite(target_mass) or abs(target_mass) > 3.0:
+            return {
+                "success": False,
+                "message": "mass must be finite and within +/-3 kg",
+                "current_mass": current_mass,
+            }
+
+        com = params.get(
+            "center_of_mass",
+            params.get(
+                "com",
+                params.get("F_x_Cload", params.get("gripper_load_center_of_mass", current_com)),
+            ),
+        )
+        if not isinstance(com, (list, tuple)) or len(com) != 3:
+            return {
+                "success": False,
+                "message": "center_of_mass/com must contain exactly 3 values",
+                "current_center_of_mass": current_com,
+            }
+        target_com = [float(v) for v in com]
+
+        result = self.update_compliance_params(
+            {
+                "gripper_load_mass": target_mass,
+                "gripper_load_center_of_mass": target_com,
+            }
+        )
+        if result["success"]:
+            with self._lock:
+                self.gripper_load_mass = target_mass
+                self.gripper_load_center_of_mass = target_com
+            result["gripper_load"] = {
+                "mass": target_mass,
+                "center_of_mass": target_com,
+            }
+        return result
+
     def _map_serl_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         mapped: Dict[str, Any] = {}
 
@@ -306,7 +432,15 @@ class FrankaRos2Server(Node):
             rotational = float(params.get("rotational_Ki", 0.0))
             mapped["integral"] = [translational] * 3 + [rotational] * 3
 
-        for direct_name in ("stiffness", "damping", "integral", "k_gains", "d_gains"):
+        for direct_name in (
+            "stiffness",
+            "damping",
+            "integral",
+            "k_gains",
+            "d_gains",
+            "gripper_load_mass",
+            "gripper_load_center_of_mass",
+        ):
             if direct_name in params:
                 value = params[direct_name]
                 mapped[direct_name] = list(value) if isinstance(value, (list, tuple)) else value
@@ -346,9 +480,14 @@ class FrankaRos2Server(Node):
 
         result_future = goal_handle.get_result_async()
         if not self._wait_for_future(result_future, self.action_timeout):
+            self.get_logger().warn("Action result timed out")
             return False
         result = result_future.result().result
-        return bool(getattr(result, "success", True))
+        success = bool(getattr(result, "success", True))
+        if not success:
+            message = getattr(result, "message", "") or getattr(result, "error", "")
+            self.get_logger().warn(f"Action failed: {message}" if message else "Action failed")
+        return success
 
     def _wait_for_future(self, future: Any, timeout: float) -> bool:
         deadline = time.time() + timeout
@@ -363,6 +502,10 @@ def make_app(server: FrankaRos2Server) -> Flask:
     @webapp.route("/health", methods=["GET", "POST"])
     def health():
         return jsonify({"ok": True, **server.state_dict()})
+
+    @webapp.route("/pose_debug", methods=["GET", "POST"])
+    def pose_debug():
+        return jsonify(server.pose_debug_dict())
 
     @webapp.route("/startimp", methods=["POST"])
     def start_impedance():
@@ -462,8 +605,15 @@ def make_app(server: FrankaRos2Server) -> Flask:
 
     @webapp.route("/set_load", methods=["POST"])
     def set_load():
-        # franka_ros2 set_load is not exposed by the current running graph.
-        return "Set Load unsupported by current ROS 2 graph"
+        result = server.adjust_gripper_load(request.json or {})
+        status = 200 if result["success"] else 503
+        return jsonify(result), status
+
+    @webapp.route("/adjust_gripper_load", methods=["POST"])
+    def adjust_gripper_load():
+        result = server.adjust_gripper_load(request.json or {})
+        status = 200 if result["success"] else 503
+        return jsonify(result), status
 
     @webapp.route("/pose", methods=["POST"])
     def pose():
@@ -495,12 +645,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose_service", default="/get_pose")
     parser.add_argument("--control_mode_service", default="/set_control_mode")
     parser.add_argument("--trajectory_action", default="/set_trajectory")
+    parser.add_argument("--equilibrium_pose_topic", default="/equilibrium_pose")
+    parser.add_argument("--pose_command_mode", default="equilibrium", choices=["trajectory", "equilibrium"])
     parser.add_argument("--move_to_start_action", default="/move_to_start")
     parser.add_argument("--gripper_move_action", default="/panda_gripper/move")
     parser.add_argument("--gripper_grasp_action", default="/panda_gripper/grasp")
     parser.add_argument("--gripper_homing_action", default="/panda_gripper/homing")
     parser.add_argument("--pose_steps", type=int, default=4)
     parser.add_argument("--action_timeout", type=float, default=5.0)
+    parser.add_argument("--default_gripper_open_width", type=float, default=0.075)
     parser.add_argument("--default_gripper_speed", type=float, default=0.3)
     parser.add_argument("--default_gripper_force", type=float, default=60.0)
     return parser.parse_args()
@@ -508,6 +661,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.pose_command_mode not in {"trajectory", "equilibrium"}:
+        raise ValueError("--pose_command_mode must be either 'trajectory' or 'equilibrium'")
     rclpy.init()
     server = FrankaRos2Server(
         controller_name=args.controller_name,
@@ -517,12 +672,15 @@ def main() -> None:
         pose_service=args.pose_service,
         control_mode_service=args.control_mode_service,
         trajectory_action=args.trajectory_action,
+        equilibrium_pose_topic=args.equilibrium_pose_topic,
+        pose_command_mode=args.pose_command_mode,
         move_to_start_action=args.move_to_start_action,
         gripper_move_action=args.gripper_move_action,
         gripper_grasp_action=args.gripper_grasp_action,
         gripper_homing_action=args.gripper_homing_action,
         pose_steps=args.pose_steps,
         action_timeout=args.action_timeout,
+        default_gripper_open_width=args.default_gripper_open_width,
         default_gripper_speed=args.default_gripper_speed,
         default_gripper_force=args.default_gripper_force,
     )
